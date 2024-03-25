@@ -1,0 +1,5 @@
+This is line 1.
+Hello, world!
+Line 3 contains the word "apple".
+Another line with the word "apple" in it.
+Line 5 does not match the pattern.
