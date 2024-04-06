@@ -1,14 +1,25 @@
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
-#include <limits.h>
+#include <sys/stat.h>
+#include <termios.h>
+#include <fcntl.h>
+#include <signal.h> 
 
 #define MAX_COMMAND_LENGTH 100
 #define MAX_ARGS 10
+#define MAX_ARGUMENTS 100
 
-// ANSI颜色转义序列
+enum RedirectType {
+    NO_REDIRECT,
+    OUTPUT_REDIRECT,
+    INPUT_REDIRECT,
+    APPEND_REDIRECT
+};
+
 #define COLOR_GREEN "\033[0;32m"
 #define COLOR_RESET "\033[0m"
 
@@ -17,13 +28,11 @@ void echo(const char *message) {
 }
 
 void change_directory(const char *path) {
-    if (path == NULL) {
-        fprintf(stderr, "目录路径为空\n");
-        return;
+    if (path == NULL || strcmp(path, "") == 0) {
+        path = getenv("HOME");
     }
 
-    if (strcmp(path, "-") == 0) {
-        // 切换到上次所在的目录
+    if (strcmp(path, "-") == 0 || strcmp(path, " ") == 0) {
         const char *previous_directory = getenv("OLDPWD");
         if (previous_directory == NULL) {
             fprintf(stderr, "找不到上次所在的目录\n");
@@ -34,14 +43,12 @@ void change_directory(const char *path) {
             return;
         }
     } else {
-        // 切换到指定的目录
         if (chdir(path) != 0) {
             perror("chdir");
             return;
         }
     }
 
-    // 更新环境变量OLDPWD为当前所在的目录
     char current_directory[4096];
     if (getcwd(current_directory, sizeof(current_directory)) == NULL) {
         perror("getcwd");
@@ -57,62 +64,57 @@ void change_directory(const char *path) {
     }
 }
 
-void execute_command(char *command, char *args[], char *output_file) {
+void execute_command(char *command, char *args[MAX_ARGS], enum RedirectType redirect_type, char *output_file, int run_in_background, char *input_file) {
     if (strcmp(command, "cd") == 0) {
-        change_directory(args[1]);
+        change_directory(args[1]); // 直接调用 change_directory
+        return;
     } else if (strcmp(command, "exit") == 0) {
-        // 退出 Shell
-        exit(0);
-    } else if (strcmp(command, "grep") == 0) {
-        // 创建子进程执行命令
-        pid_t pid = fork();
-        if (pid == -1) {
-            perror("fork");
-            exit(EXIT_FAILURE);
-        } else if (pid == 0) {
-            // 子进程
-            // 输出重定向到文件
-            if (output_file != NULL) {
-                freopen(output_file, "w", stdout);
-            }
-            // 调用 execvp 执行 grep 命令
-            execvp(command, args);
-            perror("");
-            exit(EXIT_FAILURE);
-        } else {
-            // 父进程
-            int status;
-            waitpid(pid, &status, 0);
-            if (WIFEXITED(status)) {
-                int exit_status = WEXITSTATUS(status);
-                printf("子进程退出，退出状态码：%d\n", exit_status);
-            } else if (WIFSIGNALED(status)) {
-                int term_signal = WTERMSIG(status);
-                printf("子进程被信号终止，信号编号：%d\n", term_signal);
-            }
+        exit(0); // 退出 shell
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        exit(EXIT_FAILURE);
+    } else if (pid == 0) {
+        // 子进程中的代码
+        if (run_in_background) {
+            setpgid(0, 0);
         }
-    } else if (strcmp(command, "echo") == 0) {
-        // 处理 echo 命令
-        char *message = args[1];
-        echo(message);
-    } else {
-        // 其他命令
-        // 创建子进程执行命令
-        pid_t pid = fork();
-        if (pid == -1) {
-            perror("fork");
-            exit(EXIT_FAILURE);
-        } else if (pid == 0) {
-            // 子进程
-            // 输出重定向到文件
-            if (output_file != NULL) {
-                freopen(output_file, "w", stdout);
+        if (redirect_type == OUTPUT_REDIRECT || redirect_type == APPEND_REDIRECT) {
+            int fd;
+            if (redirect_type == OUTPUT_REDIRECT) {
+                fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+            } else { // APPEND_REDIRECT
+                fd = open(output_file, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
             }
-            (command, args);
-            perror("");
-            exit(EXIT_FAILURE);
-        } else {
-            // 父进程
+            if (fd == -1) {
+                perror("open");
+                exit(EXIT_FAILURE);
+            }
+            if (dup2(fd, STDOUT_FILENO) == -1) {
+                perror("dup2");
+                exit(EXIT_FAILURE);
+            }
+            close(fd);
+        }
+        if (input_file != NULL) {
+            int fd_in = open(input_file, O_RDONLY);
+            if (fd_in == -1) {
+                perror("open");
+                exit(EXIT_FAILURE);
+            }
+            if (dup2(fd_in, STDIN_FILENO) == -1) {
+                perror("dup2");
+                exit(EXIT_FAILURE);
+            }
+            close(fd_in);
+        }
+        execvp(command, args);
+        perror("");
+        exit(EXIT_FAILURE);
+    } else {
+        if (!run_in_background) {
             int status;
             waitpid(pid, &status, 0);
             if (WIFEXITED(status)) {
@@ -125,66 +127,138 @@ void execute_command(char *command, char *args[], char *output_file) {
         }
     }
 }
+void sigint_handler(int signum) {
+    // 空函数，不执行任何操作
+}
 
 int main() {
     while (1) {
-        char command[MAX_COMMAND_LENGTH];
-        char *args[MAX_ARGS] = { NULL };
-        char output_file[4096];
+        signal(SIGINT, SIG_IGN);
+         struct termios term;//存储终端的相关信息
+        tcgetattr(STDIN_FILENO, &term);//获取相关信息，并存入结构体
+        term.c_cc[VEOF] = _POSIX_VDISABLE;//禁止使用EOF
+        tcsetattr(STDIN_FILENO, TCSANOW, &term);//将设置存入终端
 
-        // 获取当前工作目录
+        char command[MAX_COMMAND_LENGTH];
+        enum RedirectType redirect_type = NO_REDIRECT;
+        char input_file[4096];
+        char output_file[4096];
+        int run_in_background = 0;
+
         char current_directory[4096];
         if (getcwd(current_directory, sizeof(current_directory)) == NULL) {
             perror("getcwd");
             exit(EXIT_FAILURE);
         }
 
-        // 获取用户名
         char *username = getenv("USER");
 
-        // 打印提示符（用户名和当前路径）
         printf(COLOR_GREEN "%s@%s:" COLOR_RESET "%s$ ", username, getenv("HOSTNAME"), current_directory);
 
         fgets(command, sizeof(command), stdin);
         command[strcspn(command, "\n")] = '\0';
 
-        // 解析命令和参数
-        char *token = strtok(command, " ");
-        int arg_index = 0;
-        while (token != NULL && arg_index < MAX_ARGS - 1) {
-            args[arg_index] = token;
-            arg_index++;
-            token = strtok(NULL, " ");
+        if (strcmp(command, "") == 0 || strspn(command, " \t") == strlen(command)) {
+            continue;
         }
-        args[arg_index] = NULL;
 
-        // 检查是否有输出重定向符号 ">"
-        int redirect_output = 0;
-        for (int i = 0; i < arg_index; i++) {
-            if (strcmp(args[i], ">") == 0) {
-                if (i + 1 < arg_index) {
-                    strcpy(output_file, args[i + 1]);
-                    redirect_output = 1;
+        char *token = strtok(command, "|");
+        char *pipe_commands[MAX_ARGS];
+        int num_pipes = 0;
+
+        while (token != NULL && num_pipes < MAX_ARGS) {
+            pipe_commands[num_pipes++] = token;
+            token = strtok(NULL, "|");
+        }
+
+        int fd_in = 0;
+
+        for (int i = 0; i < num_pipes; i++) {
+            char *trimmed_token = strtok(pipe_commands[i], " \t");
+            if (strcmp(trimmed_token, "") == 0) {
+                continue;
+            }
+
+            char *args[MAX_ARGS];
+            int arg_index = 0;
+
+            while (trimmed_token != NULL && arg_index < MAX_ARGS - 1) {
+                if (strcmp(trimmed_token, ">") == 0 || strcmp(trimmed_token, "<") == 0 || strcmp(trimmed_token, ">>") == 0) {
+                    redirect_type = strcmp(trimmed_token, ">") == 0 ? OUTPUT_REDIRECT : strcmp(trimmed_token, ">>") == 0 ? APPEND_REDIRECT : INPUT_REDIRECT;
+                    trimmed_token = strtok(NULL, " \t");
+                    if (redirect_type == INPUT_REDIRECT) {
+                        strcpy(input_file, trimmed_token);
+                    } else {
+                        strcpy(output_file, trimmed_token);
+                    }
+                    break;
+                } else if (strcmp(trimmed_token, "&") == 0) {
+                    run_in_background = 1;
                     break;
                 }
+                args[arg_index++] = trimmed_token;
+                trimmed_token = strtok(NULL, " \t");
+            }
+            args[arg_index] = NULL;
+
+            if (strcmp(args[0], "cd") == 0) {
+                change_directory(args[1]);
+                continue;
+            } else if (strcmp(args[0], "exit") == 0) {
+                exit(0);
+            }
+
+            int pipefd[2];
+            if (pipe(pipefd) == -1) {
+                perror("pipe");
+                exit(EXIT_FAILURE);
+            }
+
+            pid_t pid = fork();
+            if (pid == -1) {
+                perror("fork");
+                exit(EXIT_FAILURE);
+            } else if (pid == 0) {
+                dup2(fd_in, 0);
+                if (i < num_pipes - 1) {
+                    dup2(pipefd[1], 1);
+                } else {
+                    if (redirect_type == OUTPUT_REDIRECT || redirect_type == APPEND_REDIRECT) {
+                        int fd;
+                        if (redirect_type == OUTPUT_REDIRECT) {
+                            fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+                        } else { // APPEND_REDIRECT
+                            fd = open(output_file, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+                        }
+                        if (fd == -1) {
+                            perror("open");
+                            exit(EXIT_FAILURE);
+                        }
+                        dup2(fd, STDOUT_FILENO);
+                        close(fd);
+                    }
+                }
+
+                if (redirect_type == INPUT_REDIRECT) {
+                    int fd_in = open(input_file, O_RDONLY);
+                    if (fd_in == -1) {
+                        perror("open");
+                        exit(EXIT_FAILURE);
+                    }
+                    dup2(fd_in, STDIN_FILENO);
+                    close(fd_in);
+                }
+
+                close(pipefd[0]);
+                execvp(args[0], args);
+                perror("execvp");
+                exit(EXIT_FAILURE);
+            } else {
+                wait(NULL);
+                close(pipefd[1]);
+                fd_in = pipefd[0];
             }
         }
-
-        // 执行命令
-        execute_command(args[0], args, redirect_output ? output_file : NULL);
-
-        // 更新当前工作目录
-        if (getcwd(current_directory, sizeof(current_directory)) == NULL) {
-            perror("getcwd");
-            exit(EXIT_FAILURE);
-        }
-
-        // 更新提示符中的路径
-        if (setenv("PWD", current_directory, 1) != 0) {
-            perror("setenv");
-            exit(EXIT_FAILURE);
-        }
     }
-
     return 0;
 }
